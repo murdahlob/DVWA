@@ -44,12 +44,24 @@ $_DVWA[ 'disable_authentication' ] = getenv('DISABLE_AUTHENTICATION') ?: false;
 
 define ('MYSQL', 'mysql');
 define ('SQLITE', 'sqlite');
+define ('PGSQL', 'postgresql');
+
+$_DVWA['SQLI_DB'] = getenv('SQLI_DB') ?: MYSQL;
+
+# PostgreSQLi DB Backend
+#   Use this to switch the backend database used in the SQLi and Blind SQLi labs.
+#   This does not affect the backend for any other services, just these two labs.
+#   If you do not understand what this means, do not change it.
+#$_DVWA['SQLI_DB'] = PGSQL;
+#$_DVWA['PGSQL_DB'] = 'dvwa';
+#$_DVWA['PGSQL_USER'] = 'dvwa';
+#$_DVWA['PGSQL_PASSWORD'] = 'password';
+#$_DVWA['PGSQL_SERVER'] = 'localhost';
 
 # SQLi DB Backend
 #   Use this to switch the backend database used in the SQLi and Blind SQLi labs.
 #   This does not affect the backend for any other services, just these two labs.
 #   If you do not understand what this means, do not change it.
-$_DVWA['SQLI_DB'] = getenv('SQLI_DB') ?: MYSQL;
 #$_DVWA['SQLI_DB'] = SQLITE;
 #$_DVWA['SQLITE_DB'] = 'sqli.db';
 
