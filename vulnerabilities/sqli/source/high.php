@@ -63,7 +63,6 @@ if( isset( $_SESSION [ 'id' ] ) ) {
 
 			// Intentionally Vulnerable query: Uses quotes and LIMIT 1
 			$query  = "SELECT first_name, last_name FROM users WHERE user_id = $id LIMIT 1;";
-			var_dump ($query);
 			$result = @pg_query($pg_conn, $query);
 
 			if ($result) {
