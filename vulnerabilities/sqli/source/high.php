@@ -47,6 +47,39 @@ if( isset( $_SESSION [ 'id' ] ) ) {
 				echo "Error in fetch ".$sqlite_db->lastErrorMsg();
 			}
 			break;
+
+		case PGSQL:
+			$host = $_DVWA[ 'PGSQL_SERVER' ];
+			$db   = $_DVWA[ 'PGSQL_DB' ];
+			$user = $_DVWA[ 'PGSQL_USER' ];
+			$pass = $_DVWA[ 'PGSQL_PASSWORD' ];
+			
+			// Connect to PostgreSQL 
+			$pg_conn = @pg_connect("host=$host dbname=$db user=$user password=$pass");
+			
+			if (!$pg_conn) {
+				die("<pre>Something went wrong.</pre>");
+			}
+
+			// Intentionally Vulnerable query: Uses quotes and LIMIT 1
+			$query  = "SELECT first_name, last_name FROM users WHERE user_id = $id LIMIT 1;";
+			var_dump ($query);
+			$result = @pg_query($pg_conn, $query);
+
+			if ($result) {
+				// Output results
+				while( $row = pg_fetch_assoc( $result ) ) {
+					$first = $row["first_name"];
+					$last  = $row["last_name"];
+					$html .= "<pre>ID: {$id}<br />First name: {$first}<br />Surname: {$last}</pre>";
+				}
+			} else {
+				// Generic error message to prevent error-based SQLi
+				echo "<pre>Something went wrong.</pre>";
+			}
+			
+			pg_close($pg_conn);
+			break;
 	}
 }
 
