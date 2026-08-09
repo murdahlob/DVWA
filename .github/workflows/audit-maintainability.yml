@@ -64,15 +64,16 @@ jobs:
       # `vulnerabilities/*/source/*.php` — expected, and a good check that the
       # tool is actually reading PHP. Scope excludes the vendored `external/`
       # libraries so their internal duplication does not swamp the signal.
+      # NOTE: the `ghcr.io/kucherenko/jscpd` image is gone (registry `denied`), so
+      # jscpd runs via `npx jscpd@4` on the runner's preinstalled Node instead.
       - name: jscpd scan (PHP, application only)
         continue-on-error: true
         run: |
-          docker run --rm -v "${PWD}:/src" ghcr.io/kucherenko/jscpd:latest \
-            /src \
+          npx --yes jscpd@4 . \
             --pattern "**/*.php" \
             --ignore "**/external/**,**/vendor/**,**/.github/**" \
             --reporters json,markdown,console \
-            --output /src/jscpd-report \
+            --output jscpd-report \
             --mode mild || true
           ls -la jscpd-report || true
 
@@ -112,7 +113,7 @@ jobs:
         run: |
           {
             echo "## jscpd"
-            echo "image: ghcr.io/kucherenko/jscpd:latest"
+            echo "runner: npx jscpd@4 (node on ubuntu-latest; ghcr image retired)"
             echo "pattern: **/*.php  ignore: external/, vendor/, .github/"
             echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
           } > jscpd-report/manifest-jscpd.txt

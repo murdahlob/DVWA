@@ -1,8 +1,22 @@
 name: CodeQL (SAST) - DVWA (PHP)
 
-# PHASE-3 SCANNING WORKFLOW (target 2, DVWA / PHP) — see the planning repo's
-# PLAN-004 and ADR-007. Ground truth: docs/plans/PLAN-007-ground-truth-dvwa.md.
+# ============================ FINDING: CodeQL DOES NOT SUPPORT PHP ===========
+# This workflow was authored on PLAN-004's assumption that "CodeQL PHP —
+# interpreted, DB from source" works. IT DOES NOT. On 2026-08-09 the first run
+# failed at `Initialize CodeQL` with:
+#     "Did not recognize the following languages: php"
+# CodeQL has no PHP extractor (supported languages are C/C++, C#, Go, Java/Kotlin,
+# JavaScript/TypeScript, Python, Ruby, Swift, Actions — PHP is absent). So the
+# DATAFLOW-SAST layer of the npm battery loses CodeQL entirely on PHP; only Snyk
+# Code (which does support PHP) survives in that column. This corrects PLAN-004's
+# per-ecosystem table and is recorded in PLAN-007-scorecard-dvwa.md.
 #
+# The workflow is retained as documentation of the attempt and set to
+# workflow_dispatch-only so it no longer auto-fails on every push. Do not expect
+# it to produce results unless GitHub adds a PHP extractor.
+# ============================================================================
+#
+# (Original rationale, kept for the record — invalid because PHP is unsupported:)
 # PHP is an INTERPRETED language for CodeQL: the database is built directly from
 # source with NO build step (`build-mode: none`). This is the cheaper of the two
 # CodeQL paths in PLAN-004's per-ecosystem table — contrast WebGoat/Java, which
@@ -25,11 +39,10 @@ name: CodeQL (SAST) - DVWA (PHP)
 # action with Security-tab upload on a PUBLIC repo is the licensed route here.
 
 on:
+  # workflow_dispatch-only: CodeQL has no PHP extractor (see header), so the push
+  # trigger was removed to stop it failing on every commit. Kept dispatchable so
+  # the failure is reproducible on demand.
   workflow_dispatch:
-  push:
-    branches: [ master ]
-    paths-ignore:
-      - '**.md'
 
 permissions:
   contents: read
