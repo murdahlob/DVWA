@@ -1,0 +1,131 @@
+name: Code Audit (maintainability / design) - DVWA
+
+# PHASE-3 SCANNING WORKFLOW (target 2, DVWA / PHP) — see the planning repo's
+# PLAN-004 and ADR-007. Ground truth: docs/plans/PLAN-007-ground-truth-dvwa.md.
+#
+# =========================== THE MAINTAINABILITY COLUMN SHRINKS =============
+# This is a REPORTABLE PLAN-004 finding, not an oversight. NodeGoat's
+# maintainability layer had FOUR instruments: jscpd, knip, dependency-cruiser and
+# SonarQube. On PHP, only TWO survive:
+#
+#   * jscpd              — language-agnostic duplication detector, supports PHP.  RUNS.
+#   * SonarQube          — has a PHP analyzer (code smells, cyclomatic complexity,
+#                          cognitive complexity, maintainability rating).         RUNS (separate
+#                          workflow / SonarQube Cloud — a human owner's step).
+#   * knip               — JavaScript/TypeScript ONLY (unused exports/files/deps
+#                          resolved from an ES/TS module graph). NO PHP support.  N/A.
+#   * dependency-cruiser — JavaScript/TypeScript ONLY (walks `import`/`require`
+#                          module graphs). NO PHP support.                        N/A.
+#
+# So two of the four design instruments are JS-only and simply do not exist for
+# PHP. That is the concrete evidence for PLAN-004's claim that "the
+# maintainability column shrinks" when the stack generalises past npm — and it
+# shrinks HERE by half. It is also compounded by the missing manifest: even the
+# npm-only tools that CAN read a manifest would have had nothing to read.
+# ===========================================================================
+#
+# Only jscpd is wired as a runnable job below. SonarQube (PHP analyzer) is a
+# platform run owned by the human (SonarQube Cloud on the public fork, or the
+# self-hosted-in-runner pattern from NodeGoat's sonarqube-community.yml adapted
+# to `-Dsonar.php.*`). knip and dependency-cruiser are intentionally ABSENT with
+# this header recording WHY, so their absence reads as a finding rather than a
+# gap someone forgot to fill.
+#
+# Self-checkout; jscpd is a plain package run through a pinned Docker image (no
+# Node toolchain on the runner needed). Application scope excludes `external/**`
+# (vendored third-party libraries) and `.github/**`.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-maintainability-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------- duplication
+  jscpd:
+    name: Design - jscpd (duplication)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # DVWA is a strong duplication target BY DESIGN: every module ships four
+      # near-identical copies (low/medium/high/impossible) that differ only in
+      # the filter line. jscpd should therefore report high duplication across
+      # `vulnerabilities/*/source/*.php` — expected, and a good check that the
+      # tool is actually reading PHP. Scope excludes the vendored `external/`
+      # libraries so their internal duplication does not swamp the signal.
+      - name: jscpd scan (PHP, application only)
+        continue-on-error: true
+        run: |
+          docker run --rm -v "${PWD}:/src" ghcr.io/kucherenko/jscpd:latest \
+            /src \
+            --pattern "**/*.php" \
+            --ignore "**/external/**,**/vendor/**,**/.github/**" \
+            --reporters json,markdown,console \
+            --output /src/jscpd-report \
+            --mode mild || true
+          ls -la jscpd-report || true
+
+      - name: Verify jscpd produced a parseable report
+        if: always()
+        run: |
+          f=jscpd-report/jscpd-report.json
+          if [ ! -s "$f" ]; then
+            echo "::error::$f is missing or empty - jscpd did not run or analyzed zero files"
+            exit 1
+          fi
+          sources=$(jq -r '.statistics.total.sources // 0' "$f")
+          clones=$(jq -r '(.duplicates | length) // 0' "$f")
+          echo "jscpd analyzed $sources PHP file(s) and found $clones clone pair(s)"
+          if [ "$sources" -eq 0 ]; then
+            echo "::error::jscpd analyzed 0 files - config wrong (this is a null result, not a clean run)"
+            exit 1
+          fi
+
+      - name: Summarise jscpd
+        if: always()
+        run: |
+          f=jscpd-report/jscpd-report.json
+          {
+            echo "## jscpd (duplication) - DVWA"
+            echo ""
+            echo "- sources analyzed: **$(jq -r '.statistics.total.sources // 0' "$f")**"
+            echo "- clone pairs: **$(jq -r '(.duplicates | length) // 0' "$f")**"
+            echo "- duplicated lines: **$(jq -r '.statistics.total.duplicatedLines // 0' "$f")** / $(jq -r '.statistics.total.lines // 0' "$f") ($(jq -r '.statistics.total.percentage // 0' "$f")%)"
+            echo ""
+            echo "High duplication across \`vulnerabilities/*/source/*.php\` is EXPECTED —"
+            echo "DVWA ships four near-identical copies of each module by design."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record run-manifest fragment (jscpd)
+        if: always()
+        run: |
+          {
+            echo "## jscpd"
+            echo "image: ghcr.io/kucherenko/jscpd:latest"
+            echo "pattern: **/*.php  ignore: external/, vendor/, .github/"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > jscpd-report/manifest-jscpd.txt
+
+      - name: Upload jscpd report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maintainability-jscpd
+          path: jscpd-report/
+          if-no-files-found: error
+
+  # knip and dependency-cruiser are deliberately NOT jobs here — they are
+  # JavaScript/TypeScript-only and have no PHP support. Their absence is the
+  # finding (see the header). SonarQube's PHP analyzer runs as a separate
+  # platform workflow (owner's step), scored from its drained output.

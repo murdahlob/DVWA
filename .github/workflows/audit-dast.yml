@@ -1,0 +1,258 @@
+name: Code Audit (DAST) - DVWA  [DRAFT - NEEDS HUMAN REVIEW BEFORE FIRST RUN]
+
+# =========================================================================
+#  DRAFT — DO NOT RUN UNREVIEWED. The DVWA boot + authentication +
+#  security-level flow is non-trivial and MUST be reviewed by the human owner
+#  before this workflow is enabled. Unlike NodeGoat (single POST login against a
+#  seeded Mongo), DVWA requires, IN ORDER:
+#     1. a running MariaDB (compose `db` service),
+#     2. one-time DATABASE CREATION via `POST /setup.php` (create_db), which
+#        needs the anti-CSRF `user_token` scraped from the setup page,
+#     3. a form login `POST /login.php` (admin / password) that ALSO needs a
+#        scraped `user_token`,
+#     4. setting the SECURITY LEVEL via `POST /security.php`
+#        (`security=<level>&seclev_submit=Submit&user_token=<scraped>`), which
+#        is stored in the SESSION — so every scanner must carry the same
+#        authenticated session cookie, and the level must be RE-SET per pass.
+#  Every one of those steps scrapes a fresh CSRF token, and a scanner that
+#  crawls `/logout.php` throws the session away mid-scan. The token-scraping
+#  regexes below are the fragile part and are the specific thing to review.
+#
+#  This file is a STRUCTURED STARTING POINT, not a validated pipeline. The
+#  scanner invocations (ZAP / Nuclei / Nikto) are copied from the proven
+#  NodeGoat audit-dast.yml; the DVWA-specific bootstrap is new and unverified.
+# =========================================================================
+#
+# PHASE-3 DAST WORKFLOW (target 2, DVWA / PHP) — PLAN-004 / ADR-007.
+# Ground truth: docs/plans/PLAN-007-ground-truth-dvwa.md.
+#
+# SAFETY — DVWA is INTENTIONALLY VULNERABLE (that is the entire point).
+#   * `workflow_dispatch` only — never on push/PR.
+#   * The scanned URL is HARDCODED to http://127.0.0.1:4280 inside the runner and
+#     is NOT an input, so this workflow cannot be pointed at anything else.
+#   * The app is NEVER deployed or exposed; compose publishes 4280 on the
+#     runner's own loopback and the runner is destroyed at job end.
+#   * Nuclei runs with `-ni` (interactsh disabled) so no OAST callbacks leave the
+#     runner.
+#   * DVWA's default admin/password and the DB creds in compose.yml are the
+#     application's own published defaults on a throwaway in-runner database —
+#     not secrets.
+#
+# DAST reports are run artifacts only, NOT Security-tab uploads (runtime URL
+# findings, not source lines).
+
+on:
+  workflow_dispatch:
+    inputs:
+      security_level:
+        description: "DVWA security level to scan (low / medium / high). Re-run per level; DAST results are per-level."
+        required: false
+        default: "low"
+        type: choice
+        options: [ low, medium, high ]
+      run_zap_baseline:
+        description: "ZAP baseline (passive) scan"
+        required: false
+        default: true
+        type: boolean
+      run_zap_full:
+        description: "ZAP full ACTIVE scan (sends attack payloads)"
+        required: false
+        default: true
+        type: boolean
+      run_nuclei:
+        description: "Nuclei"
+        required: false
+        default: true
+        type: boolean
+      run_nikto:
+        description: "Nikto"
+        required: false
+        default: true
+        type: boolean
+      zap_spider_minutes:
+        description: "Minutes ZAP may spend spidering (per scan)"
+        required: false
+        default: "5"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-dast-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TARGET_URL: "http://127.0.0.1:4280"
+  REPORT_DIR: dast-reports
+  DVWA_USER: admin
+  DVWA_PASS: password
+
+jobs:
+  dast:
+    name: DAST - ZAP / Nuclei / Nikto (DRAFT)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare report directory
+        run: |
+          mkdir -p "$REPORT_DIR"
+          chmod 777 "$REPORT_DIR"
+
+      # compose.yml already maps 127.0.0.1:4280:80 and wires the MariaDB `db`
+      # service. `pull_policy: always` pulls the prebuilt image; to scan THIS
+      # tree instead, uncomment the volume mount in compose.yml (review item).
+      - name: Start DVWA (app + MariaDB, in-runner only)
+        run: |
+          docker compose up -d
+          docker compose ps
+
+      - name: Wait for the application to respond
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fsS -o /dev/null "$TARGET_URL/login.php"; then
+              echo "App is up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::App did not respond on $TARGET_URL/login.php within 180s"
+          docker compose logs --no-color || true
+          exit 1
+
+      # ---------------------------------------------------------------
+      #  REVIEW ITEM #1 — one-time DB creation. setup.php renders a form with a
+      #  user_token; POST create_db=Create... with that token to build the
+      #  schema and seed the default users. The token regex is fragile.
+      # ---------------------------------------------------------------
+      - name: Create the DVWA database (setup.php)
+        id: setup
+        run: |
+          jar="$RUNNER_TEMP/jar.txt"; : > "$jar"
+          tok=$(curl -sS -c "$jar" -b "$jar" "$TARGET_URL/setup.php" \
+                | grep -oP "user_token'?\s+value='?\K[0-9a-f]{32}" | head -1)
+          echo "setup user_token: ${tok:0:6}... (len ${#tok})"
+          code=$(curl -sS -o "$RUNNER_TEMP/setup.out" -w '%{http_code}' -b "$jar" -c "$jar" \
+                   --data-urlencode "create_db=Create / Reset Database" \
+                   --data-urlencode "user_token=${tok}" \
+                   "$TARGET_URL/setup.php")
+          echo "POST /setup.php -> HTTP $code"
+          # MariaDB may still be initialising on first boot; give it a couple retries.
+          for i in 1 2 3; do
+            sleep 5
+            curl -sS -b "$jar" -c "$jar" -o /dev/null "$TARGET_URL/setup.php"
+          done
+
+      # ---------------------------------------------------------------
+      #  REVIEW ITEM #2 — form login. Scrape the login-page token, POST creds.
+      #  Success = a valid PHPSESSID that reaches an authenticated page.
+      # ---------------------------------------------------------------
+      - name: Log in as admin and set the security level
+        id: auth
+        run: |
+          jar="$RUNNER_TEMP/session.txt"; : > "$jar"
+          LEVEL='${{ inputs.security_level }}'
+          login_tok=$(curl -sS -c "$jar" -b "$jar" "$TARGET_URL/login.php" \
+                      | grep -oP "user_token'?\s+value='?\K[0-9a-f]{32}" | head -1)
+          curl -sS -b "$jar" -c "$jar" -o /dev/null \
+            --data-urlencode "username=${DVWA_USER}" \
+            --data-urlencode "password=${DVWA_PASS}" \
+            --data-urlencode "Login=Login" \
+            --data-urlencode "user_token=${login_tok}" \
+            "$TARGET_URL/login.php"
+          # Confirm the session is authenticated.
+          idx=$(curl -sS -b "$jar" -o /dev/null -w '%{http_code}' "$TARGET_URL/index.php")
+          echo "GET /index.php with session -> HTTP $idx"
+          if [ "$idx" != "200" ]; then
+            echo "::error::login did not yield an authenticated session (HTTP $idx). REVIEW the token regex / default creds."
+            docker compose logs --no-color db | tail -40 || true
+            exit 1
+          fi
+          # REVIEW ITEM #3 — set the security level (stored in session).
+          sec_tok=$(curl -sS -b "$jar" -c "$jar" "$TARGET_URL/security.php" \
+                    | grep -oP "user_token'?\s+value='?\K[0-9a-f]{32}" | head -1)
+          curl -sS -b "$jar" -c "$jar" -o /dev/null \
+            --data-urlencode "security=${LEVEL}" \
+            --data-urlencode "seclev_submit=Submit" \
+            --data-urlencode "user_token=${sec_tok}" \
+            "$TARGET_URL/security.php"
+          echo "security level requested: ${LEVEL}"
+          # Hand the session cookie to the scanners. ZAP/Nuclei/Nikto below still
+          # need to be pointed at this cookie AND told to exclude /logout.php —
+          # that wiring is REVIEW ITEM #4 (a ZAP Automation Framework plan with
+          # form auth + poll re-auth, as in NodeGoat's audit-dast.yml, is the
+          # robust approach and should replace static-cookie injection here).
+          cp "$jar" "$REPORT_DIR/session-cookies.txt"
+
+      # ------------------------------- ZAP (unauthenticated passes work as-is;
+      # the AUTHENTICATED pass is the review item — see NodeGoat's Automation
+      # Framework plan for the pattern to port).
+      - name: ZAP baseline scan (passive)
+        if: inputs.run_zap_baseline
+        continue-on-error: true
+        env:
+          ZAP_SPIDER_MINUTES: ${{ inputs.zap_spider_minutes }}
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "$TARGET_URL" -m "$ZAP_SPIDER_MINUTES" \
+              -r zap-baseline.html -J zap-baseline.json -x zap-baseline.xml -w zap-baseline.md -I
+
+      - name: ZAP full scan (ACTIVE)
+        if: inputs.run_zap_full
+        continue-on-error: true
+        env:
+          ZAP_SPIDER_MINUTES: ${{ inputs.zap_spider_minutes }}
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py -t "$TARGET_URL" -m "$ZAP_SPIDER_MINUTES" \
+              -r zap-full.html -J zap-full.json -x zap-full.xml -w zap-full.md -I
+
+      - name: Nuclei scan
+        if: inputs.run_nuclei
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/reports:rw" \
+            projectdiscovery/nuclei:latest \
+              -target "$TARGET_URL" -ni -no-color -stats \
+              -jsonl-export /reports/nuclei.jsonl -sarif-export /reports/nuclei.sarif -output /reports/nuclei.txt
+
+      - name: Nikto scan (JSON)
+        if: inputs.run_nikto
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/output:rw" \
+            ghcr.io/sullo/nikto:latest \
+              -h "$TARGET_URL" -maxtime 15m -Format json -o /output/nikto.json
+
+      - name: Collect application logs
+        if: always()
+        run: docker compose logs --no-color > "$REPORT_DIR/app.log" 2>&1 || true
+
+      - name: Stop application
+        if: always()
+        run: docker compose down -v || true
+
+      - name: Verify each enabled tool produced a report
+        if: always()
+        run: |
+          check() { [ "$2" != "true" ] && return 0; [ -s "$REPORT_DIR/$3" ] || echo "::warning::$1 enabled but produced no $3"; }
+          check "ZAP baseline"  "${{ inputs.run_zap_baseline }}" zap-baseline.json
+          check "ZAP full scan" "${{ inputs.run_zap_full }}"     zap-full.json
+          check "Nuclei"        "${{ inputs.run_nuclei }}"       nuclei.jsonl
+          check "Nikto"         "${{ inputs.run_nikto }}"        nikto.json
+
+      - name: Upload DAST reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-reports-${{ inputs.security_level }}
+          path: ${{ env.REPORT_DIR }}/
+          if-no-files-found: warn

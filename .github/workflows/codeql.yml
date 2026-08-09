@@ -1,0 +1,112 @@
+name: CodeQL (SAST) - DVWA (PHP)
+
+# PHASE-3 SCANNING WORKFLOW (target 2, DVWA / PHP) — see the planning repo's
+# PLAN-004 and ADR-007. Ground truth: docs/plans/PLAN-007-ground-truth-dvwa.md.
+#
+# PHP is an INTERPRETED language for CodeQL: the database is built directly from
+# source with NO build step (`build-mode: none`). This is the cheaper of the two
+# CodeQL paths in PLAN-004's per-ecosystem table — contrast WebGoat/Java, which
+# is COMPILED and needs autobuild/a real Maven build. DVWA needs neither, which
+# is exactly why PHP is the lighter of the two new ecosystems (PLAN-004
+# execution order, target 2 before target 3).
+#
+# The code is hosted in this fork, so CodeQL runs in its native shape: results go
+# to Security -> Code scanning AND are kept as a run artifact for offline jq
+# comparison against the other scanners' SARIF (ADR-002).
+#
+# `security-extended` is selected deliberately: the point of including CodeQL is
+# the deepest free taint analysis available, and DVWA's planted flaws (SQLi,
+# command injection, file inclusion, XSS) are exactly the taint-tracking queries
+# the extended suite adds. Note that CodeQL's PHP query pack is smaller than its
+# JS pack — record which of the 55 ground-truth rows its rules actually reach.
+#
+# LICENCE NOTE (ADR-009): DVWA's codebase is GPL-3.0, an OSI-approved licence, so
+# the codebase is an "Open Source Codebase" under the CodeQL Terms. The hosted
+# action with Security-tab upload on a PUBLIC repo is the licensed route here.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    name: CodeQL - php
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        id: codeql-init
+        uses: github/codeql-action/init@v3
+        with:
+          languages: php
+          # PHP is interpreted: no autobuild, database is built from source.
+          build-mode: none
+          queries: security-extended
+
+      - name: CodeQL analyze
+        id: codeql-analyze
+        continue-on-error: true          # a scanner failure must not sink the run
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql
+          output: codeql-results
+          upload: always
+
+      - name: Collect CodeQL SARIF
+        if: always()
+        run: |
+          cp codeql-results/*.sarif codeql.sarif 2>/dev/null \
+            || echo "::warning::CodeQL produced no SARIF - check the analyze step log"
+          if [ -s codeql.sarif ]; then
+            {
+              echo "## CodeQL (PHP)"
+              echo ""
+              echo "results: $(jq '[.runs[].results[]?] | length' codeql.sarif)"
+              echo "rules:   $(jq '.runs[0].tool.driver.rules | length' codeql.sarif)"
+              echo "scanned SHA: \`${GITHUB_SHA}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Record run manifest (CodeQL)
+        if: always()
+        run: |
+          {
+            echo "# CodeQL run manifest (DVWA / PHP)"
+            echo "workflow run: ${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT:-1})"
+            echo "date (UTC):   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "repository:   ${GITHUB_REPOSITORY}"
+            echo "scanned SHA:  ${GITHUB_SHA}"
+            echo "action:       github/codeql-action@v3"
+            echo "language:     php (build-mode: none, interpreted - no build step)"
+            echo "query suite:  security-extended"
+            echo "bundle:       $("${{ steps.codeql-init.outputs.codeql-path }}" version --format=terse 2>/dev/null || echo 'n/a')"
+          } > run-manifest-codeql.txt
+          cat run-manifest-codeql.txt
+
+      - name: Upload CodeQL SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-codeql
+          path: |
+            codeql.sarif
+            run-manifest-codeql.txt
+          if-no-files-found: warn

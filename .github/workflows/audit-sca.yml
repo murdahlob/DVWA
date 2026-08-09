@@ -1,0 +1,310 @@
+name: Code Audit (SCA + secrets) - DVWA
+
+# PHASE-3 SCANNING WORKFLOW (target 2, DVWA / PHP) — see the planning repo's
+# PLAN-004 and ADR-007. Ground truth: docs/plans/PLAN-007-ground-truth-dvwa.md.
+#
+# ================================ ECOSYSTEM CAVEAT ==========================
+# THE MAIN APPLICATION CARRIES NO DEPENDENCY MANIFEST. `find . -name composer.*`
+# at the pinned commit returns ONLY `vulnerabilities/api/composer.lock` (+ .json)
+# — the OpenAPI-doc generator's build-time deps (psr/log, symfony/*,
+# zircote/swagger-php). The main DVWA app is flat PHP that bundles its libraries
+# under `external/` (reCAPTCHA, jQuery) with NO lockfile. So the SCA layer here
+# has almost nothing to scan. Trivy and OSV-Scanner will find advisories ONLY in
+# `vulnerabilities/api/composer.lock`, and those are for a docs generator, not
+# the served app. This near-empty SCA surface is itself a reportable finding
+# about how the tool stack generalises past npm (PLAN-004 question 2): on npm
+# every project has a lockfile; on this PHP app there is effectively none.
+# ===========================================================================
+#
+# Layout per PLAN-004's per-ecosystem table: Trivy + OSV-Scanner over the repo
+# (SCA + Trivy's secret/misconfig scanners over the Dockerfile/compose.yml),
+# plus gitleaks for secrets. There is no `composer audit` step because there is
+# no root manifest to run it against; a composer-audit note is recorded instead.
+#
+# Self-checkout, SARIF twice (Security tab + artifact, ADR-002). Application-only
+# scoring excludes `.github/**` and `external/**`. Nothing installs Composer
+# dependencies or runs any PHP.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: audit-sca-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- OSV
+  osv-scanner:
+    name: SCA - OSV-Scanner
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Recursive so it finds vulnerabilities/api/composer.lock (the only
+      # manifest). Pinned action release; input is `scan-args` in v2.
+      - name: Run OSV-Scanner
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --recursive
+            --format=sarif
+            --output=osv.sarif
+            ./
+
+      - name: Record run-manifest fragment (OSV-Scanner)
+        if: always()
+        run: |
+          {
+            echo "## osv-scanner"
+            echo "action: google/osv-scanner-action/osv-scanner-action@v2.3.8"
+            echo "note:   only vulnerabilities/api/composer.lock exists to scan"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-osv.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-osv
+          path: manifest-osv.txt
+          if-no-files-found: warn
+
+      - name: Upload OSV SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: osv.sarif
+          category: osv-scanner
+
+      - name: Upload OSV SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-osv-scanner
+          path: osv.sarif
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------- Trivy
+  trivy:
+    name: SCA + secrets + misconfig - Trivy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # DVWA carries a Dockerfile and compose.yml at the repo root, so Trivy's
+      # `misconfig` scanner has container files to analyse; `secret` scans the
+      # whole tree; `vuln` reads vulnerabilities/api/composer.lock (the only
+      # manifest). One pass — there is no dev/prod dependency split to isolate
+      # like there was on NodeGoat's package-lock.
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy.sarif
+
+      - name: Trivy filesystem scan (JSON, for offline analysis)
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: json
+          output: trivy.json
+
+      - name: Record run-manifest fragment (Trivy)
+        if: always()
+        run: |
+          {
+            echo "## trivy"
+            echo "action: aquasecurity/trivy-action@v0.36.0"
+            echo "scanners: vuln,secret,misconfig"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-trivy.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-trivy
+          path: manifest-trivy.txt
+          if-no-files-found: warn
+
+      - name: Upload Trivy SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+      - name: Upload Trivy output as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-trivy
+          path: |
+            trivy.sarif
+            trivy.json
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------- gitleaks
+  # Working-tree secret scan. DVWA's config carries fixed default keys
+  # (e.g. the reCAPTCHA sample keys, `config/config.inc.php` defaults) which are
+  # documentation values, not live secrets — a good discriminator for how noisy
+  # each secret scanner is on a teaching app. Released binary, checksum-verified,
+  # rather than the vendor action (the action needs a paid licence for
+  # org-owned repos). Report written to RUNNER_TEMP, NOT into the scanned tree
+  # (the self-scan bug: a secret scanner that writes its report where it scans
+  # then finds the secrets in its own output).
+  gitleaks:
+    name: Secrets - gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gitleaks (pinned, checksum-verified)
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o "$asset" "${base}/${asset}"
+          curl -sSfL -o checksums.txt "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${asset}\$" checksums.txt > expected-checksum.txt
+          [ -s expected-checksum.txt ] || { echo "::error::asset not in checksums file"; exit 1; }
+          sha256sum -c expected-checksum.txt
+          tar -xzf "$asset" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+          mkdir -p "${RUNNER_TEMP}/gitleaks-reports"
+          echo "REPORT_DIR=${RUNNER_TEMP}/gitleaks-reports" >> "$GITHUB_ENV"
+
+      # `--exit-code 0` (not continue-on-error): gitleaks exits 1 for BOTH a
+      # finding and a real error; the house continue-on-error pattern swallows
+      # both alike (the Nikto failure mode). Setting the leak exit code to 0
+      # keeps a genuine crash fatal while a finding is not.
+      - name: gitleaks scan (working tree, SARIF + JSON)
+        run: |
+          gitleaks dir . --report-format sarif \
+            --report-path "$REPORT_DIR/gitleaks.sarif" --exit-code 0 --no-banner
+          gitleaks dir . --report-format json \
+            --report-path "$REPORT_DIR/gitleaks.json" --exit-code 0 --no-banner
+
+      - name: Verify gitleaks produced a rule-carrying report
+        if: always()
+        run: |
+          f="$REPORT_DIR/gitleaks.sarif"
+          [ -s "$f" ] || { echo "::error::gitleaks.sarif missing/empty"; exit 1; }
+          rules=$(jq '.runs[0].tool.driver.rules | length' "$f" 2>/dev/null || echo 0)
+          [ "${rules:-0}" -eq 0 ] && { echo "::error::gitleaks loaded zero rules"; exit 1; }
+          echo "gitleaks findings: $(jq 'length' "$REPORT_DIR/gitleaks.json" 2>/dev/null || echo '?')"
+
+      - name: Record run-manifest fragment (gitleaks)
+        if: always()
+        run: |
+          {
+            echo "## gitleaks"
+            echo "version: $(gitleaks version 2>/dev/null || echo 'n/a')"
+            echo "pass:    dir (working tree at HEAD)"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > "$REPORT_DIR/manifest-gitleaks.txt"
+
+      - name: Collect reports into the workspace for upload
+        if: always()
+        run: |
+          mkdir -p gitleaks-reports
+          cp "$REPORT_DIR"/* gitleaks-reports/ 2>/dev/null || true
+
+      - name: Upload gitleaks SARIF to Security tab
+        if: always() && hashFiles('gitleaks-reports/gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks-reports/gitleaks.sarif
+          category: gitleaks
+
+      - name: Upload gitleaks reports as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks
+          path: gitleaks-reports/
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------- aggregation
+  summary:
+    name: SCA summary
+    runs-on: ubuntu-latest
+    needs: [ osv-scanner, trivy, gitleaks ]
+    if: always()
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Download SARIF artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sarif-*
+          path: sarif
+          merge-multiple: true
+
+      - name: Count findings per SARIF file
+        run: |
+          {
+            echo "## SCA + secrets summary (DVWA)"
+            echo ""
+            echo "Reminder: the app has NO manifest; SCA advisories can only come"
+            echo "from \`vulnerabilities/api/composer.lock\` (an OpenAPI docs generator)."
+            echo ""
+            echo "| SARIF file | results |"
+            echo "|---|---|"
+            shopt -s nullglob
+            for f in sarif/*.sarif; do
+              n=$(jq '[.runs[].results[]?] | length' "$f" 2>/dev/null || echo "parse error")
+              echo "| $(basename "$f") | ${n} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # OSV / Trivy are rules-are-findings scanners, so an EMPTY SARIF is a
+      # legitimate outcome here (there may be no advisory in the one lockfile) —
+      # a rule-count liveness check would WRONGLY fail a correct clean run
+      # (PLAN-004 english-vocab scorecard, "rule count is not a portable liveness
+      # signal"). Liveness therefore asserts the file EXISTS and PARSES, not that
+      # it carries rules.
+      - name: Verify each expected SARIF exists and parses
+        run: |
+          fail=0
+          for f in osv.sarif trivy.sarif; do
+            p="sarif/$f"
+            if [ ! -s "$p" ]; then
+              echo "::error::$f is missing or empty - its scanner failed silently"
+              fail=1
+              continue
+            fi
+            jq -e '.runs[0].tool.driver' "$p" >/dev/null 2>&1 || { echo "::error::$f is not valid SARIF"; fail=1; }
+          done
+          exit "$fail"

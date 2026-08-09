@@ -1,0 +1,275 @@
+name: Code Audit (static SAST) - DVWA
+
+# PHASE-3 SCANNING WORKFLOW (target 2, DVWA / PHP) — see the planning repo's
+# PLAN-004 (Phase 3 targets) and ADR-007 (why the scanning workflows live in the
+# fork rather than in the evaluation repo). Ground truth:
+# docs/plans/PLAN-007-ground-truth-dvwa.md (55 rows, pinned commit
+# 209930b26ef16b1636dfac74ca49b5557fd0528e).
+#
+# This is the PHP adaptation of the NodeGoat audit-static.yml. The per-ecosystem
+# table in PLAN-004 maps the SAST layer as: Semgrep `p/php` packs (replacing the
+# JS/Node packs), and Snyk Code (language-aware, needs SNYK_TOKEN). CodeQL PHP
+# runs in codeql.yml; SonarQube (PHP analyzer) is a maintainability/platform run.
+#
+# Self-checkout: this scans THIS repository's own tree, so SARIF paths resolve
+# and results can reach the Security tab. SARIF is published twice (Security tab
+# + run artifact) per ADR-002.
+#
+# APPLICATION-ONLY SCOPE. Unlike NodeGoat (which excludes only `.github/**`),
+# DVWA bundles third-party libraries under `external/` (the reCAPTCHA lib, jQuery,
+# etc.) with no manifest. Application-only counts must exclude BOTH `.github/**`
+# and `external/**`. Filtering is done at SCORING time over the SARIF, not at the
+# scanner, so the raw output stays comparable across baselines (the phase-1
+# lesson: never let scanner-side filtering make the raw output disagree with the
+# reported numbers).
+#
+# Nothing here installs Composer dependencies or executes any PHP. DAST is
+# audit-dast.yml.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: audit-static-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- Semgrep
+  semgrep:
+    name: SAST - Semgrep (p/php)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # docker run rather than a container job, for the same reason as NodeGoat:
+      # the semgrep/semgrep image is Alpine/musl and cannot host the glibc Node
+      # that JavaScript actions (checkout / upload-sarif) need. Keep the scanner
+      # in a plain step and leave those actions on the host runner.
+      #
+      # Rule packs: the generic security packs plus `p/php` — the pack that
+      # matches this stack, replacing NodeGoat's `p/javascript` + `p/nodejs`.
+      - name: Semgrep scan
+        continue-on-error: true
+        run: |
+          docker run --rm --user 0 \
+            -v "${PWD}:/src" -w /src \
+            semgrep/semgrep \
+            semgrep scan \
+              --config p/default \
+              --config p/security-audit \
+              --config p/secrets \
+              --config p/owasp-top-ten \
+              --config p/php \
+              --metrics off \
+              --sarif --output /src/semgrep.sarif
+
+      - name: Record run-manifest fragment (Semgrep)
+        if: always()
+        run: |
+          {
+            echo "## semgrep"
+            echo "image:   $(docker image inspect --format '{{index .RepoDigests 0}}' semgrep/semgrep 2>/dev/null || echo 'not pulled')"
+            echo "version: $(docker run --rm semgrep/semgrep semgrep --version 2>/dev/null || echo 'n/a')"
+            echo "packs:   p/default p/security-audit p/secrets p/owasp-top-ten p/php"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-semgrep.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-semgrep
+          path: manifest-semgrep.txt
+          if-no-files-found: warn
+
+      - name: Upload Semgrep SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload Semgrep SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-semgrep
+          path: semgrep.sarif
+          if-no-files-found: warn
+
+  # ----------------------------------------------- Snyk Code (needs SNYK_TOKEN)
+  # Snyk Code is language-aware SAST and supports PHP. Gated on the SNYK_TOKEN
+  # repository secret existing (a human owner's step). Safe here in a way it was
+  # not in phase 1: it checks out code we own and host and never installs or runs
+  # the dependency tree, so the secret never shares a job with third-party code
+  # execution.
+  #
+  # `snyk code test --sarif-file-output=` writes SARIF and exits non-zero when it
+  # finds issues, hence continue-on-error. Note (per PLAN-004 english-vocab
+  # scorecard): Snyk emits a SARIF rule only for a rule that FIRED, so a clean
+  # scan yields a valid zero-rule SARIF — a rule-count liveness check is WRONG
+  # for Snyk. Liveness comes from the CLI's own `enabled: yes` / exit status.
+  snyk-code:
+    name: SAST - Snyk Code
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: snyk/actions/setup@master
+
+      - name: Snyk Code test
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk code test --sarif-file-output=snyk-code.sarif
+
+      - name: Record run-manifest fragment (Snyk Code)
+        if: always()
+        run: |
+          {
+            echo "## snyk code"
+            echo "cli version: $(snyk --version 2>/dev/null || echo 'n/a')"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-snyk-code.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-snyk-code
+          path: manifest-snyk-code.txt
+          if-no-files-found: warn
+
+      - name: Upload Snyk Code SARIF to Security tab
+        if: always() && hashFiles('snyk-code.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
+
+      - name: Upload Snyk Code SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-snyk-code
+          path: snyk-code.sarif
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------- aggregation
+  summary:
+    name: Findings summary
+    runs-on: ubuntu-latest
+    needs: [ semgrep, snyk-code ]
+    if: always()
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Download all SARIF artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sarif-*
+          path: sarif
+          merge-multiple: true
+
+      - name: Count findings per SARIF file (whole-tree and application-only)
+        run: |
+          {
+            echo "## Static SAST summary"
+            echo ""
+            echo "Scanned repo: \`${GITHUB_REPOSITORY}\`"
+            echo "Scanned SHA:  \`${GITHUB_SHA}\`"
+            echo ""
+            echo "Application-only excludes \`.github/**\` (our harness) AND"
+            echo "\`external/**\` (DVWA's vendored third-party libraries)."
+            echo ""
+            echo "| SARIF file | whole-tree | application-only |"
+            echo "|---|---|---|"
+            shopt -s nullglob
+            for f in sarif/*.sarif; do
+              n=$(jq '[.runs[].results[]?] | length' "$f" 2>/dev/null || echo "parse error")
+              a=$(jq '[.runs[].results[]
+                       | select((.locations[0].physicalLocation.artifactLocation.uri // "")
+                                 | (startswith(".github/") or startswith("external/")) | not)]
+                      | length' "$f" 2>/dev/null || echo "parse error")
+              echo "| $(basename "$f") | ${n} | ${a} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Semgrep emits its full loaded ruleset regardless of findings, so a
+      # rule-count liveness check is valid FOR SEMGREP ONLY. Snyk emits rules
+      # only for findings (a clean scan is a valid zero-rule SARIF) — do NOT
+      # rule-count Snyk (PLAN-004 english-vocab scorecard, "rule count is not a
+      # portable liveness signal"). Snyk liveness is its own artifact existing.
+      - name: Verify expected SARIF was produced
+        run: |
+          fail=0
+          # Semgrep: must exist, be non-empty, carry >=1 rule.
+          f=sarif/semgrep.sarif
+          if [ ! -s "$f" ]; then
+            echo "::error::semgrep.sarif is missing or empty - the scanner failed silently"
+            fail=1
+          else
+            rules=$(jq '.runs[0].tool.driver.rules | length' "$f" 2>/dev/null || echo 0)
+            [ "${rules:-0}" -eq 0 ] && { echo "::error::semgrep.sarif loaded zero rules"; fail=1; }
+          fi
+          # Snyk: file must exist (zero rules is legitimate). A missing file when
+          # the secret is set is a silent failure; when the secret is absent the
+          # job is skipped and this is a warning, not an error.
+          if [ ! -f sarif/snyk-code.sarif ]; then
+            echo "::warning::snyk-code.sarif absent - Snyk Code did not run (SNYK_TOKEN unset?) or failed; check the snyk-code job"
+          fi
+          exit "$fail"
+
+      - name: Download run-manifest fragments
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: manifest-*
+          path: manifest
+          merge-multiple: true
+
+      - name: Assemble run manifest
+        if: always()
+        run: |
+          {
+            echo "# Static SAST run manifest (DVWA)"
+            echo "workflow run: ${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT:-1})"
+            echo "date (UTC):   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "repository:   ${GITHUB_REPOSITORY}"
+            echo "scanned SHA:  ${GITHUB_SHA}"
+            echo ""
+            cat manifest/*.txt 2>/dev/null || echo "no per-job fragments recovered"
+          } > run-manifest.txt
+          cat run-manifest.txt
+
+      - name: Upload run manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest
+          path: run-manifest.txt
+          if-no-files-found: warn
+
+      - name: Re-upload combined SARIF bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-all
+          path: sarif/
+          if-no-files-found: warn
