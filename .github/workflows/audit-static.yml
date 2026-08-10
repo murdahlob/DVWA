@@ -129,15 +129,41 @@ jobs:
       contents: read
       security-events: write
     steps:
+      # Self-checkout the PINNED scanned commit (not the dispatched ref) so the
+      # Snyk Code scan analyses exactly the ground-truth tree.
       - uses: actions/checkout@v4
+        with:
+          ref: 209930b26ef16b1636dfac74ca49b5557fd0528e
 
       - uses: snyk/actions/setup@master
+
+      # APPLICATION-ONLY SCOPE. Exclude DVWA's vendored third-party libraries
+      # (external/**) and the CI harness (.github/**) from Snyk Code. A .snyk
+      # policy file's `exclude.global` globs are honoured by the Snyk CLI. Written
+      # at runtime (not committed) because the pinned checkout above replaces the
+      # tree with the 209930b commit, which carries no .snyk file.
+      - name: Scope Snyk to application code
+        run: |
+          cat > .snyk <<'EOF'
+          # Snyk policy file - exclude vendored libs and CI harness from Snyk Code
+          version: v1.0.0
+          exclude:
+            global:
+              - external/**
+              - .github/**
+          EOF
+          echo "wrote .snyk:"; cat .snyk
 
       - name: Snyk Code test
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: snyk code test --sarif-file-output=snyk-code.sarif
+        run: |
+          # Diagnostic: token LENGTH only (never the value). Distinguishes an
+          # empty/unset secret (0) from a present-but-invalid token (>0). GitHub
+          # masks the value but not its length.
+          echo "SNYK_TOKEN length: ${#SNYK_TOKEN}"
+          snyk code test --sarif-file-output=snyk-code.sarif
 
       - name: Record run-manifest fragment (Snyk Code)
         if: always()

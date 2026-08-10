@@ -1,0 +1,160 @@
+name: SonarCloud export - DVWA
+
+# PHASE-3 SonarCloud RESULT-COLLECTION workflow (target 2, DVWA / PHP).
+#
+# SonarCloud results live on sonarcloud.io and need SONAR_TOKEN to export. This
+# workflow runs INSIDE Actions (where the secret is available) to:
+#   1. resolve the project key (api/projects/search, org murdahlob) — expect
+#      murdahlob_DVWA;
+#   2. if the project has NO completed analysis yet, run one against the PINNED
+#      commit (sonarqube-scan-action) and wait for the Compute-Engine task;
+#      if automatic analysis already ran, skip scanning (CI + automatic analysis
+#      are mutually exclusive on SonarCloud);
+#   3. export unresolved issues (api/issues/search, paginated) + security
+#      hotspots (api/hotspots/search) as a run artifact.
+#
+# A token-LENGTH diagnostic (never the value) distinguishes an empty/unset
+# SONAR_TOKEN secret from a present-but-invalid one.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sonar-export:
+    name: SonarCloud export
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_ORG: murdahlob
+      PINNED_SHA: 209930b26ef16b1636dfac74ca49b5557fd0528e
+    steps:
+      # fetch-depth 0 so the scanner (if it runs) can attribute blame; harmless
+      # for the export-only path.
+      - uses: actions/checkout@v4
+        with:
+          ref: 209930b26ef16b1636dfac74ca49b5557fd0528e
+          fetch-depth: 0
+
+      - name: Diagnose token and resolve project key
+        id: resolve
+        run: |
+          echo "SONAR_TOKEN length: ${#SONAR_TOKEN}"
+          code=$(curl -s -u "$SONAR_TOKEN:" \
+            "https://sonarcloud.io/api/projects/search?organization=${SONAR_ORG}" \
+            -o proj.json -w '%{http_code}')
+          echo "projects/search HTTP: $code"
+          cat proj.json || true
+          KEY=$(jq -r '.components[0].key // empty' proj.json 2>/dev/null)
+          if [ -z "$KEY" ]; then
+            echo "projects/search returned no key; trying components/search_projects"
+            curl -s -u "$SONAR_TOKEN:" \
+              "https://sonarcloud.io/api/components/search_projects?organization=${SONAR_ORG}" \
+              -o comp.json -w 'components/search_projects HTTP: %{http_code}\n' || true
+            cat comp.json || true
+            KEY=$(jq -r '.components[0].key // empty' comp.json 2>/dev/null)
+          fi
+          [ -z "$KEY" ] && KEY="${SONAR_ORG}_DVWA"
+          echo "Resolved project key: $KEY"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Check for an existing completed analysis
+        id: check
+        run: |
+          KEY='${{ steps.resolve.outputs.key }}'
+          code=$(curl -s -u "$SONAR_TOKEN:" \
+            "https://sonarcloud.io/api/project_analyses/search?project=${KEY}&ps=1" \
+            -o an.json -w '%{http_code}')
+          echo "project_analyses/search HTTP: $code"
+          cat an.json || true
+          N=$(jq -r '.analyses | length' an.json 2>/dev/null || echo 0)
+          echo "existing analyses: $N"
+          echo "count=$N" >> "$GITHUB_OUTPUT"
+
+      # Only runs when SonarCloud has no analysis yet (i.e. automatic analysis is
+      # NOT enabled). Application-scoped via sonar.exclusions.
+      - name: Run SonarCloud scan (only if no analysis exists)
+        if: steps.check.outputs.count == '0'
+        uses: SonarSource/sonarqube-scan-action@v4
+        with:
+          args: >
+            -Dsonar.organization=${{ env.SONAR_ORG }}
+            -Dsonar.projectKey=${{ steps.resolve.outputs.key }}
+            -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.sources=.
+            -Dsonar.exclusions=external/**,.github/**,**/*.min.js
+            -Dsonar.scm.revision=${{ env.PINNED_SHA }}
+
+      - name: Wait for the Compute-Engine task
+        if: steps.check.outputs.count == '0'
+        run: |
+          CE=$(sed -n 's/^ceTaskUrl=//p' .scannerwork/report-task.txt)
+          echo "ceTaskUrl=$CE"
+          for i in $(seq 1 60); do
+            curl -s -u "$SONAR_TOKEN:" "$CE" -o ce.json
+            ST=$(jq -r '.task.status' ce.json 2>/dev/null || echo UNKNOWN)
+            echo "attempt $i: status=$ST"
+            case "$ST" in
+              SUCCESS) echo "analysis complete"; break ;;
+              FAILED|CANCELED) echo "::error::CE task $ST"; cat ce.json; exit 1 ;;
+            esac
+            sleep 10
+          done
+
+      - name: Export issues (paginated) and hotspots
+        run: |
+          KEY='${{ steps.resolve.outputs.key }}'
+          page=1
+          while :; do
+            curl -s -u "$SONAR_TOKEN:" \
+              "https://sonarcloud.io/api/issues/search?componentKeys=${KEY}&resolved=false&ps=500&p=${page}" \
+              -o "issues_p${page}.json"
+            total=$(jq -r '.total // 0' "issues_p${page}.json")
+            got=$(jq -r '.issues | length' "issues_p${page}.json")
+            echo "issues page ${page}: got ${got} of total ${total}"
+            fetched=$(( (page - 1) * 500 + got ))
+            { [ "$got" -eq 0 ] || [ "$fetched" -ge "$total" ]; } && break
+            page=$((page + 1))
+          done
+          jq -s '{total: (.[0].total // 0), issues: (map(.issues) | add // [])}' issues_p*.json > sonar-issues.json
+          echo "merged issues: $(jq -r '.issues | length' sonar-issues.json)"
+
+          curl -s -u "$SONAR_TOKEN:" \
+            "https://sonarcloud.io/api/hotspots/search?projectKey=${KEY}&ps=500&p=1" \
+            -o sonar-hotspots.json
+          echo "hotspots: $(jq -r '.hotspots | length' sonar-hotspots.json 2>/dev/null || echo parse-error)"
+
+      - name: Summarise counts
+        if: always()
+        run: |
+          {
+            echo "## SonarCloud export"
+            echo ""
+            echo "Project key: \`${{ steps.resolve.outputs.key }}\`"
+            echo "Existing analyses at start: ${{ steps.check.outputs.count }}"
+            echo ""
+            if [ -f sonar-issues.json ]; then
+              echo "- total unresolved issues: $(jq -r '.issues | length' sonar-issues.json)"
+              echo "- VULNERABILITY: $(jq -r '[.issues[] | select(.type==\"VULNERABILITY\")] | length' sonar-issues.json)"
+              echo "- BUG: $(jq -r '[.issues[] | select(.type==\"BUG\")] | length' sonar-issues.json)"
+              echo "- CODE_SMELL: $(jq -r '[.issues[] | select(.type==\"CODE_SMELL\")] | length' sonar-issues.json)"
+            fi
+            if [ -f sonar-hotspots.json ]; then
+              echo "- SECURITY_HOTSPOT: $(jq -r '.hotspots | length' sonar-hotspots.json)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SonarCloud export
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonar-export
+          path: |
+            sonar-issues.json
+            sonar-hotspots.json
+            proj.json
+            an.json
+          if-no-files-found: warn
