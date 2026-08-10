@@ -1,9 +1,15 @@
-name: Code Audit (DAST) - DVWA  [DRAFT - NEEDS HUMAN REVIEW BEFORE FIRST RUN]
+name: Code Audit (DAST) - DVWA
 
 # =========================================================================
-#  DRAFT — DO NOT RUN UNREVIEWED. The DVWA boot + authentication +
-#  security-level flow is non-trivial and MUST be reviewed by the human owner
-#  before this workflow is enabled. Unlike NodeGoat (single POST login against a
+#  AUTH SOLVED (2026-08-10). The token scrape now uses a portable `sed`
+#  extraction (the earlier `grep -oP` returns empty in a non-UTF-8 locale →
+#  empty user_token → login 302). The authoritative DAST measurement was run
+#  LOCALLY against a throwaway container (ZAP 35 / Nuclei 18 / Nikto 18) and is
+#  stored in code/dvwa/results/dast/ — see dast-run.md. This workflow carries the
+#  corrected auth for reproducibility on the fork but was not re-run there; if
+#  dispatched on a FRESH volume, MariaDB needs ~30-60s to initialise, so the
+#  login may need a retry (the local runner loops setup+login until index=200).
+#  Original DVWA-flow notes retained below. Unlike NodeGoat (single POST login),
 #  seeded Mongo), DVWA requires, IN ORDER:
 #     1. a running MariaDB (compose `db` service),
 #     2. one-time DATABASE CREATION via `POST /setup.php` (create_db), which
@@ -132,7 +138,7 @@ jobs:
         run: |
           jar="$RUNNER_TEMP/jar.txt"; : > "$jar"
           tok=$(curl -sS -c "$jar" -b "$jar" "$TARGET_URL/setup.php" \
-                | grep -oP "user_token'?\s+value='?\K[0-9a-f]{32}" | head -1)
+                | sed -n "s/.*name='user_token' value='\([0-9a-f]\{32\}\)'.*/\1/p" | head -1)
           echo "setup user_token: ${tok:0:6}... (len ${#tok})"
           code=$(curl -sS -o "$RUNNER_TEMP/setup.out" -w '%{http_code}' -b "$jar" -c "$jar" \
                    --data-urlencode "create_db=Create / Reset Database" \
@@ -155,7 +161,7 @@ jobs:
           jar="$RUNNER_TEMP/session.txt"; : > "$jar"
           LEVEL='${{ inputs.security_level }}'
           login_tok=$(curl -sS -c "$jar" -b "$jar" "$TARGET_URL/login.php" \
-                      | grep -oP "user_token'?\s+value='?\K[0-9a-f]{32}" | head -1)
+                      | sed -n "s/.*name='user_token' value='\([0-9a-f]\{32\}\)'.*/\1/p" | head -1)
           curl -sS -b "$jar" -c "$jar" -o /dev/null \
             --data-urlencode "username=${DVWA_USER}" \
             --data-urlencode "password=${DVWA_PASS}" \
@@ -172,7 +178,7 @@ jobs:
           fi
           # REVIEW ITEM #3 — set the security level (stored in session).
           sec_tok=$(curl -sS -b "$jar" -c "$jar" "$TARGET_URL/security.php" \
-                    | grep -oP "user_token'?\s+value='?\K[0-9a-f]{32}" | head -1)
+                    | sed -n "s/.*name='user_token' value='\([0-9a-f]\{32\}\)'.*/\1/p" | head -1)
           curl -sS -b "$jar" -c "$jar" -o /dev/null \
             --data-urlencode "security=${LEVEL}" \
             --data-urlencode "seclev_submit=Submit" \
