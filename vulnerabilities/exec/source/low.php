@@ -11,6 +11,7 @@ if( isset( $_POST[ 'Submit' ]  ) ) {
 	}
 	else {
 		// *nix
+		// NOTE: user-supplied $target is concatenated into the shell command (command-injection sink).
 		$cmd = shell_exec( 'ping  -c 4 ' . $target );
 	}
 
